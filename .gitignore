@@ -146,6 +146,17 @@ rabbitmq-data/
 # ActiveMQ
 activemq-data/
 
+# Downloaded datasets, model weights, and generated experiment outputs
+/data/raw/*
+!/data/raw/.gitkeep
+/data/processed/*
+!/data/processed/.gitkeep
+/results/checkpoints/
+/results/metrics/*
+!/results/metrics/.gitkeep
+/results/figures/*
+!/results/figures/.gitkeep
+
 # SageMath parsed files
 *.sage.py
 

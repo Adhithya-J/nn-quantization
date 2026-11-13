@@ -1,92 +1,105 @@
-# Neural Network Quantization Study
+# Pretrained Neural Network Quantization Study
 
-This project studies how a conventional neural network's accuracy changes as its
-weights and activations are represented with fewer bits. It starts with simple,
-data-agnostic quantization and progressively uses calibration data and model
-behavior to make better quantization choices.
+This project starts from a standard pretrained neural network and studies
+post-training weight quantization. It does not train or fine-tune the model.
 
-## Starting experiment
+## Current experiment
 
-- **Dataset:** MNIST, with fixed train/validation/test splits and normalization.
-- **Model:** a small fully connected classifier (784 → 256 → 128 → 10), trained
-  in FP32 as the reference model.
-- **Precision ladder:** FP32 reference, FP16 and BF16, FP8 (E4M3 and E5M2),
-  then integer weights at INT16, INT8, INT4, INT2, and 1-bit. Include INT32 as
-  a wide integer reference / accumulator where relevant, not as a low-bit model
-  compression point. Some formats require emulation if the chosen hardware or
-  framework does not support them natively.
-- **Primary result:** test accuracy and accuracy lost relative to the FP32 model.
-  Also report model storage estimates and quantization settings so runs can be
-  compared fairly.
+- **Model:** torchvision ResNet-18 with its published ImageNet-1K pretrained
+  weights (`ResNet18_Weights.DEFAULT`). The weights are downloaded from the
+  official torchvision checkpoint host on first run and cached by torchvision.
+- **Quantization:** blind symmetric global-scale weight quantization at INT16,
+  INT8, INT4, INT2, and 1-bit. Biases and activations stay FP32. Quantized
+  weights are dequantized to FP32 for inference, so this measures the effect of
+  quantization; it does not run packed integer kernels or measure latency.
+- **Selective format:** an activation-informed mixed precision format. It
+  forwards separate Imagenette training images through the network, measures
+  how often each layer input channel is active, then assigns 6 bits to more
+  active input-channel weight groups and 4 bits to less active groups. This
+  gives about 4.5 bits per quantized weight on average, similar in spirit to a
+  mixed-block 4-bit format. It is a small research implementation, not a
+  bit-compatible GGUF Q4_K_M/Q4_S_M encoder.
+- **Test set:** a deterministic, balanced 500-image sample from Imagenette's
+  labeled validation split (50 images per class). Accuracy is scored only among
+  those 10 Imagenette classes, even though the pretrained network has 1,000
+  output classes. This is the quick iteration setting; it does not run full
+  ImageNet validation.
 
-## Experiment progression
+## Run
 
-1. **FP32 reference:** train once, record baseline metrics, and save the model.
-2. **Floating-point reduced precision:** evaluate FP16, BF16, and supported FP8
-   formats against FP32. Record the FP8 format and scaling policy because E4M3
-   and E5M2 have different range/precision tradeoffs.
-3. **Blind integer weight quantization:** apply the same symmetric uniform
-   quantizer to every weight tensor, with no calibration examples and no
-   layer-specific adjustment. Sweep INT16, INT8, INT4, INT2, and 1-bit where
-   meaningful. This establishes the simplest quantization baseline.
-4. **Layer-wise weight quantization:** keep the same quantizer but choose scales
-   per layer rather than globally; compare per-tensor and per-channel scales.
-5. **Activation-calibrated quantization:** collect activation statistics from a
-   calibration split, then quantize activations using observed ranges. Compare
-   min/max ranges with robust clipping (for example, percentile clipping).
-6. **Activation-informed weight choices:** use calibration activations to
-   estimate which layers are most sensitive to weight quantization. Allocate
-   more bits to sensitive layers and fewer to tolerant layers under a stated
-   average-bit budget. This makes explicit how activation magnitudes and
-   downstream error affect the choice of which weights need precision.
-7. **Optional fine-tuning:** fine-tune the quantized model (QAT or a clearly
-   specified quantization-aware fine-tuning variant) and report separately from
-   post-training quantization results.
+Install dependencies in a virtual environment:
 
-For every stage, evaluate the same held-out test set at each bit width. Keep
-training data, calibration data, and test data separate; calibration must not
-use test examples. Record seeds and quantization parameters alongside results.
+```bash
+python -m venv .venv
+# Windows: .venv\\Scripts\\activate
+# macOS/Linux: source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e .
+```
 
-## Comparisons to make
+Run the default quantization sweep from the repository root:
 
-Plot test accuracy against effective bits per weight, with one curve per method.
-Include the FP32 reference, and report per-layer bit allocations for mixed
-precision. Clearly distinguish weight-only quantization from quantizing both
-weights and activations. Storage estimates should include scale/zero-point
-overhead where practical; latency is hardware- and kernel-dependent, so only
-compare it when measured on the same runtime and device.
+```bash
+python experiments/scripts/run_quantization.py
+```
 
-## Scope
+On first use, torchvision downloads the pretrained ResNet-18 checkpoint, and
+the run downloads Imagenette into `data/raw/`. A copy of the original model
+state is also saved at `results/checkpoints/resnet18_pretrained_fp32.pt`, so
+future runs can load it without contacting the model host. Imagenette is
+published by fast.ai; its `train` split is used only for activation calibration
+and its `val` split only for measurement. By default, a seeded sample selects
+50 validation images per class; edit `test_images_per_class` to adjust the
+quick test size. The loader verifies the archive checksum and maps folders to
+the matching ImageNet-1K outputs. Images use the preprocessing transforms
+published with the pretrained weights.
 
-The first milestone is a reproducible MNIST MLP experiment and the blind
-weight-only baseline. More advanced calibration, mixed-precision allocation,
-and quantization-aware fine-tuning build on that baseline rather than being
-bundled into one opaque result.
+Results are written to
+`results/metrics/pretrained_resnet18_quantization.json`. The report measures
+the original model and every quantized copy on the same 500 Imagenette images,
+and includes 10-class test accuracy, accuracy drop, quantization settings,
+parameter count, calibration/test sample counts, and estimated storage.
+Storage is an estimate and excludes container/alignment overhead. The blind
+baseline uses one global scale; the selective method uses one scale per
+input-channel group and leaves batch-normalization weights in FP32.
+
+### Latest quick comparison
+
+Measured on 500 images (50 per class), with predictions restricted to the 10
+Imagenette classes:
+
+| Method | Effective weight bits | Top-1 accuracy | Accuracy drop |
+| --- | ---: | ---: | ---: |
+| Original FP32 | 32 | 97.4% | — |
+| Blind global INT8 | 8 | 97.0% | 0.4 points |
+| Blind global INT4 | 4 | 10.4% | 87.0 points |
+| Activation-selected 4/6-bit groups | 4.50 | 96.4% | 1.0 point |
+| Blind global INT2 | 2 | 10.0% | 87.4 points |
+| Blind global INT1 | 1 | Non-finite outputs | — |
+
+The mixed method keeps more-active input-channel groups at 6 bits and uses 4
+bits for the rest. In this quick run it retained 96.4% accuracy with an
+estimated 6.63 MB parameter storage, compared with 46.76 MB for FP32. These
+numbers are an initial 500-image measurement, not a claim about full ImageNet
+validation accuracy.
+
+## Future scope
+
+The only supported model is pretrained torchvision ResNet-18 and the current
+test set is Imagenette. Model training and fine-tuning are out of scope. Other
+pretrained architectures and test datasets (including Fashion-MNIST and full
+ImageNet), improved activation sensitivity scores, group-size and bit-allocation
+experiments, activation quantization, and packed integer inference are future
+extensions.
 
 ## Repository layout
 
 ```text
-configs/                    Shared/default run configuration
-data/
-  raw/                      Downloaded source data (not committed)
-  processed/                Prepared splits and cached tensors (not committed)
-docs/                       Experiment notes and design decisions
-experiments/
-  configs/                  Per-experiment overrides
-  scripts/                  Reproducible run entry points
-results/
-  figures/                  Plots
-  metrics/                  Machine-readable result summaries
-src/
-  data/                     Dataset loading and preprocessing
-  models/                   FP32 reference model definitions
-  training/                 Training and optional fine-tuning loops
-  quantization/
-    floating_point/         FP16, BF16, and FP8 paths
-    integer/                 INT16 through 1-bit quantizers
-    mixed_precision/         Sensitivity analysis and bit allocation
-  evaluation/               Metrics and comparison utilities
+experiments/configs/         Run configuration
+experiments/scripts/         Quantization entry point
+src/data/                    Optional validation data adapter
+src/evaluation/              Evaluation metrics
+src/models/                  Pretrained model loader
+src/quantization/integer/    Integer weight quantizer
+results/metrics/             Generated machine-readable results
 ```
-
-Data, generated results, and experiment-specific code stay separate from the
-reusable implementation in `src/`.

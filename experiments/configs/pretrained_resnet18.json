@@ -1,0 +1,13 @@
+{
+  "model": "resnet18",
+  "test_dataset": "imagenette",
+  "data_root": "data/raw",
+  "seed": 42,
+  "test_images_per_class": 50,
+  "calibration_images": 512,
+  "bits": [16, 8, 4, 2, 1],
+  "batch_size": 128,
+  "cpu_threads": 4,
+  "num_workers": 0,
+  "output_dir": "results"
+}
