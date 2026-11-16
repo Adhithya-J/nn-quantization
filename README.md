@@ -1,76 +1,75 @@
-# Pretrained Neural Network Quantization Study
+# Neural Network Quantization: A Socratic Study
 
-This project starts from a standard pretrained neural network and studies
-post-training weight quantization. It does not train or fine-tune the model.
+This repository presents an inquiry-driven, **Socratic journey through post-training weight quantization (PTQ)** on a pretrained vision model (torchvision ResNet-18 on ImageNet/Imagenette). 
 
-## Current experiment
+Rather than treating quantization as an opaque black box, the project progresses step-by-step from naive discretization to cutting-edge Pareto-optimal sub-3-bit compression—uncovering failure modes, mathematical root causes, and architectural trade-offs along the way.
 
-- **Model:** torchvision ResNet-18 with its published ImageNet-1K pretrained
-  weights (`ResNet18_Weights.DEFAULT`). The weights are downloaded from the
-  official torchvision checkpoint host on first run and cached by torchvision.
-- **Quantization:** blind symmetric global-scale weight quantization at INT16,
-  INT8, INT4, INT2, and 1-bit. Biases, batch normalization, and activations stay FP32.
-  One-bit uses mean-absolute scaling (XNOR-Net style) to prevent activation overflow.
-  Quantized weights are dequantized to FP32 for inference, so this measures the effect of
-  quantization; it does not run packed integer kernels or measure latency.
-- **Selective format:** an activation-informed mixed precision format. It
-  forwards separate Imagenette training images through the network, measures
-  how often each layer input channel is active, then assigns 6 bits to more
-  active input-channel weight groups and 4 bits to less active groups. This
-  gives about 4.5 bits per quantized weight on average, similar in spirit to a
-  mixed-block 4-bit format. It is a small research implementation, not a
-  bit-compatible GGUF Q4_K_M/Q4_S_M encoder.
-- **Test set:** a deterministic, balanced 500-image sample from Imagenette's
-  labeled validation split (50 images per class). Accuracy is scored only among
-  those 10 Imagenette classes, even though the pretrained network has 1,000
-  output classes. This is the quick iteration setting; it does not run full
-  ImageNet validation.
+---
 
-## Run
+## The Socratic Learning Path
 
-Install dependencies in a virtual environment:
+The project is structured into 5 progressive steps:
 
+1. **Act I: The Free Lunch Illusion (Global INT8)**
+   - *Question:* Can we simply round 32-bit floating point weights to 8-bit integers using a single scale factor?
+   - *Result:* **97.8%** (matching FP32's 97.4%). Uniform 8-bit quantization is virtually lossless because 256 discrete bins keep rounding noise far below model tolerance.
+2. **Act II: The Catastrophic Collapse (Global INT4 & The Outlier Tyranny)**
+   - *Question:* If 8-bit worked effortlessly, why does Global INT4 collapse to **10.0%** (random guessing)?
+   - *Investigation:* In `conv1`, high-magnitude outlier weights inflate the model-wide step size $\Delta = 0.145$. Because deep layers have mean magnitudes of only $0.015$, **98.4% of all weights in the network round directly to 0.0 (99.9% in `layer4`)**.
+   - *The 1-Bit Overflow:* Binarizing BatchNorm scale $\gamma$ compounds a $160\times$ gain across 18 layers ($160^{18} \approx 10^{39} > \text{float32}_{\max}$), exploding to `inf` and `NaN`. Keeping BatchNorm in FP32 and applying mean-absolute scaling restores stability.
+3. **Act III: Isolating Outliers (Per-Channel & OMSE Clipping)**
+   - *Question:* If one outlier channel ruins the step size for the entire network, what if each output channel gets its own scale?
+   - *Result:* PyTorch/TensorRT standard per-channel scaling recovers accuracy from 10.0% to **89.6%**.
+   - *The Socratic Twist:* Can deliberately throwing away outlier tails *improve* accuracy?
+   - *OMSE Clipping (Banner et al., NeurIPS 2019):* Saturating the outer 10–20% outlier tails ($\alpha = 0.8$) cuts the step size in half for the dense 80% bulk of weights, pushing accuracy to **93.0%**.
+4. **Act IV: Sub-Channel Granularity (Group-Wise & Asymmetric Zero-Points)**
+   - *Question:* In deep layers, a single channel has 4,608 weights. Is 1 scale per channel enough?
+   - *Result:* Grouping weights into contiguous blocks of $G=32$ (AWQ / GPTQ / GGUF style) with asymmetric zero-points reaches **96.6%** at 4-bit, and recovers 3-bit accuracy from 82.6% (symmetric) to **91.8%** (asymmetric).
+5. **Act V: The Architectural Discovery (Sensitivity-Guided Pareto Optimization)**
+   - *Question:* Must every layer have the exact same bit-width?
+   - *The Discovery:* Parameter distribution is severely skewed: `layer4` contains **75.1%** of all model weights, while sensitive bottleneck layers (`conv1` and skip projections) account for **$<6.2\%$**.
+   - *The Breakthrough (HAWQ / Fisher style):* Allocating 8-bit or 4-bit to tiny sensitive layers adds $<0.05$ bits model-wide, allowing the 75% parameter bulk in `layer4` to be compressed to 2-bit or 3-bit:
+     - **2.04 effective bits**: **92.8%** accuracy (4.85 MB)
+     - **2.25 effective bits**: **95.6%** accuracy (5.14 MB)
+     - **2.53 effective bits**: **97.8%** accuracy (**exceeds FP32 baseline** at an **$8.4\times$ compression ratio!**)
+
+---
+
+## How to Explore
+
+### 1. Interactive Jupyter Notebook (Recommended)
+Open and run the self-contained walkthrough notebook:
 ```bash
-python -m venv .venv
-# Windows: .venv\\Scripts\\activate
-# macOS/Linux: source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -e .
+jupyter notebook notebooks/socratic_quantization_journey.ipynb
+```
+The notebook includes markdown discussions, diagnostic code cells, weight distribution histograms, zero-percentage layer bar charts, parameter distribution pie charts, Pareto curves, and an interactive custom bit budget allocator.
+
+### 2. Step-by-Step CLI Walkthrough
+Run any individual step or the entire progression from your terminal:
+```bash
+# Run step-by-step
+python experiments/scripts/socratic_walkthrough.py --step 1
+python experiments/scripts/socratic_walkthrough.py --step 2
+python experiments/scripts/socratic_walkthrough.py --step 3
+python experiments/scripts/socratic_walkthrough.py --step 4
+python experiments/scripts/socratic_walkthrough.py --step 5
+
+# Or run the complete story
+python experiments/scripts/socratic_walkthrough.py --all
 ```
 
-Run the default quantization sweep from the repository root:
-
+### 3. Full Benchmark Suite
+To regenerate the full machine-readable benchmark JSON across all 21 evaluated configurations:
 ```bash
 python experiments/scripts/run_quantization.py
 ```
+Results are saved to `results/metrics/pretrained_resnet18_quantization.json`.
 
-On first use, torchvision downloads the pretrained ResNet-18 checkpoint, and
-the run downloads Imagenette into `data/raw/`. A copy of the original model
-state is also saved at `results/checkpoints/resnet18_pretrained_fp32.pt`, so
-future runs can load it without contacting the model host. Imagenette is
-published by fast.ai; its `train` split is used only for activation calibration
-and its `val` split only for measurement. By default, a seeded sample selects
-50 validation images per class; edit `test_images_per_class` to adjust the
-quick test size. The loader verifies the archive checksum and maps folders to
-the matching ImageNet-1K outputs. Images use the preprocessing transforms
-published with the pretrained weights.
+---
 
-Results are written to
-`results/metrics/pretrained_resnet18_quantization.json`. The report measures
-the original model and every quantized copy on the same 500 Imagenette images,
-and includes 10-class test accuracy, accuracy drop, quantization settings,
-parameter count, calibration/test sample counts, and estimated storage.
-Storage is an estimate and excludes container/alignment overhead. In addition to blind
-global scaling, the repository implements activation-selected mixed precision across
-multiple bit pairs, per-channel symmetric quantization with OMSE clipping, block-level
-group-wise quantization (symmetric and asymmetric), and HAWQ/Fisher-style sensitivity-guided
-mixed-precision budget allocation that pushes sub-3-bit and 2-bit frontiers. All methods keep
-batch-normalization parameters and biases in FP32.
+## Comprehensive Benchmark Comparison
 
-### Latest quick comparison
-
-Measured on 500 images (50 per class), with predictions restricted to the 10
-Imagenette classes:
+Measured on a balanced 500-image sample (50 per class) from Imagenette's labeled validation split:
 
 | Family | Method | Effective Bits | Top-1 Accuracy | Accuracy Drop | Loss | Storage |
 |---|---|---:|---:|---:|---:|---:|
@@ -96,23 +95,21 @@ Imagenette classes:
 | **Blind Global** | Global INT2 | 2.00 | 10.0% | 87.4 points | 2.3027 | 2.96 MB |
 | **Blind Global** | Global INT1 (XNOR-Net scale) | 1.00 | 10.0% | 87.4 points | 2.3131 | 1.50 MB |
 
-## Future scope
+---
 
-The only supported model is pretrained torchvision ResNet-18 and the current
-test set is Imagenette. Model training and fine-tuning are out of scope. Other
-pretrained architectures and test datasets (including Fashion-MNIST and full
-ImageNet), improved activation sensitivity scores, group-size and bit-allocation
-experiments, activation quantization, and packed integer inference are future
-extensions.
-
-## Repository layout
+## Repository Layout
 
 ```text
-experiments/configs/         Run configuration
-experiments/scripts/         Quantization entry point
-src/data/                    Optional validation data adapter
-src/evaluation/              Evaluation metrics
-src/models/                  Pretrained model loader
-src/quantization/integer/    Integer weight quantizer
-results/metrics/             Generated machine-readable results
+notebooks/                   Interactive Socratic Jupyter Notebook
+  socratic_quantization_journey.ipynb
+experiments/
+  configs/                   Run configurations
+  scripts/                   CLI tools (socratic_walkthrough.py, run_quantization.py)
+src/
+  data/                      Validation and calibration data loaders
+  evaluation/                Classification accuracy and loss metrics
+  models/                    Pretrained model loaders
+  quantization/integer/      Quantization algorithms (per-channel, group-wise, sensitivity-guided)
+results/
+  metrics/                   Machine-readable benchmark JSONs
 ```
