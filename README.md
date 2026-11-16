@@ -6,6 +6,39 @@ Rather than treating quantization as an opaque black box, the project progresses
 
 ---
 
+## Core Fundamentals: Signal Dynamics & Quantization Mechanics
+
+Before diving into empirical comparisons, it is essential to understand the mathematical physics of deep neural networks:
+
+### 1. Signal Propagation & Layer Gain
+In an $L$-layer network, activations evolve as $x_{l+1} = \sigma(W_l x_l + b_l)$. Under standard initialization (He / Xavier), the weights are distributed such that the expected per-layer variance gain $g_l \approx 1$:
+$$\|x_L\| \approx \left(\prod_{l=1}^{L} g_l\right) \|x_0\| = g^L \|x_0\|$$
+
+### 2. The Quantization Grid & The Zero-Bin
+Quantizing weights to $b$ bits maps continuous values into $2^b$ discrete levels spaced by step size $s$:
+$$s = \frac{\beta - \alpha}{2^b - 1}, \quad q = \text{clamp}\left(\left\lfloor \frac{w}{s} \right\rceil + z, 0, 2^b - 1\right), \quad \hat{w} = (q - z) \cdot s$$
+Any weight whose magnitude falls within the zero-bin $|w| < \frac{s}{2}$ rounds directly to **0.0**.
+
+### 3. Why Values Approach Zero (Signal Vanishing)
+- **Mechanism:** When $s$ is inflated (e.g., driven by layer-wide outliers), the zero-bin widens. In deep layers with dense, small-magnitude distributions, 90–99% of weights fall into the zero-bin and round to 0.0.
+- **Compounding Attenuation:** The effective layer gain drops below unity ($g \ll 1$). Across 18 layers, signal magnitude attenuates as $g^{18} \to 0$ (e.g. $0.6^{18} \approx 0.0001$).
+- **ReLU Death:** When signals collapse toward zero, non-linear activations ($\text{ReLU}(x) = \max(0, x)$) permanently threshold neurons to zero, destroying all semantic discrimination and collapsing accuracy to random guessing (10.0%).
+
+### 4. Why Values Blow Up (`inf` & `NaN`)
+- **Mechanism:** If reconstructed weights are amplified by a scale factor $s$ that exceeds actual weight magnitudes (as observed when binarizing BatchNorm scales $\gamma$), each layer applies an artificial gain $g = \frac{s}{\text{mean}(|W|)} \gg 1$.
+- **Overflowing Float32 Limits:** In naive 1-bit quantization, $g \approx 160\times$ per layer. Across 18 layers:
+  $$\|x_{18}\| \approx 160^{18} \approx 1.2 \times 10^{39} > \text{float32}_{\max} \approx 3.4 \times 10^{38}$$
+- **Result:** Activations overflow the single-precision ceiling into `+inf`. Downstream operations like normalization or $\text{Softmax}(\infty)$ produce `NaN` (Not-a-Number), crashing execution.
+
+### 5. The Weight Clipping Dilemma (OMSE)
+Uniform quantization faces a fundamental trade-off:
+$$\text{Total Error} = \underbrace{\text{Clipping Error}}_{|w| > \alpha \text{ (tails truncated)}} + \underbrace{\text{Rounding Error}}_{|w| \le \alpha \text{ (grid step size } \Delta \propto \alpha)}$$
+- **No Clipping ($\alpha = \max|W|$):** Large $\Delta$ causes rounding error to dominate, drowning weights into zero.
+- **Excessive Clipping ($\alpha \ll \max|W|$):** Small $\Delta$ preserves dense resolution, but truncating tails causes signal attenuation.
+- **Optimal MSE Clipping (OMSE):** Finds the optimal threshold $\alpha^* \in [0.6, 1.0]$ minimizing total $L_2$ distortion.
+
+---
+
 ## The Socratic Learning Path
 
 The project is structured into 5 progressive steps:
