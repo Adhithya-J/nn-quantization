@@ -44,9 +44,13 @@ def print_banner(step_num, title, question):
     print(f"  [Socratic Question]: \"{question}\"\n")
 
 
-def load_environment():
+def load_environment(device_name=None):
     torch.set_num_threads(4)
-    device = torch.device("cpu")
+    if device_name:
+        device = torch.device(device_name)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Active Device: {device}")
     checkpoint_path = ROOT / "results/checkpoints/resnet18_pretrained_fp32.pt"
     model, weights = load_pretrained_model("resnet18", checkpoint_path)
     model = model.to(device).eval()
@@ -258,13 +262,14 @@ def step_5(model, test_loader, calibration_loader, class_indices, device):
 def main():
     parser = argparse.ArgumentParser(description="Socratic Walkthrough of Neural Network Quantization")
     parser.add_argument("--step", type=str, default="all", choices=["1", "2", "3", "4", "5", "all"])
+    parser.add_argument("--device", type=str, default=None, help="Device to use ('cuda', 'cuda:0', or 'cpu')")
     args = parser.parse_args()
 
     print("\n" + "#" * 80)
     print("  SOCRATIC WALKTHROUGH: THE POST-TRAINING QUANTIZATION DISCOVERY JOURNEY")
     print("#" * 80)
 
-    model, test_loader, calibration_loader, class_indices, device = load_environment()
+    model, test_loader, calibration_loader, class_indices, device = load_environment(args.device)
 
     steps = [args.step] if args.step != "all" else ["1", "2", "3", "4", "5"]
 
