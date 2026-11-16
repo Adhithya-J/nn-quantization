@@ -12,7 +12,15 @@ sys.path.insert(0, str(ROOT / "src"))
 from data.imagenette import make_calibration_loader, make_test_loader
 from evaluation.metrics import evaluate
 from models.vision import load_pretrained_model
-from quantization.integer.weight import quantize_activation_selected, quantize_weights
+from quantization.integer.weight import (
+    compute_channel_activity,
+    compute_layer_sensitivities,
+    quantize_activation_selected,
+    quantize_groupwise,
+    quantize_per_channel,
+    quantize_sensitivity_guided,
+    quantize_weights,
+)
 
 
 def main():
@@ -66,40 +74,161 @@ def main():
         quantized = copy.deepcopy(model)
         scales = quantize_weights(quantized, bits)
         metrics = evaluate(quantized, test_loader, device, class_indices)
+        quantized_names = set(scales["quantized_tensors"]) if scales else set()
         result = {
             "metrics": metrics,
             "accuracy_drop": (results["fp32"]["accuracy"] - metrics["accuracy"]
                               if metrics["accuracy"] is not None else None),
             "nominal_weight_bits": bits,
             "estimated_storage_bytes": (
-                sum(p.numel() for name, p in quantized.named_parameters() if name.endswith("weight")) * bits // 8
-                + sum(p.numel() * 4 for name, p in quantized.named_parameters() if not name.endswith("weight"))
+                sum(p.numel() * bits // 8 for name, p in quantized.named_parameters() if name in quantized_names)
+                + sum(p.numel() * 4 for name, p in quantized.named_parameters() if name not in quantized_names)
                 + (4 if scales else 0)
             ),
             "quantization": scales,
         }
         results["methods"][f"int{bits}"] = result
 
-    selective = copy.deepcopy(model)
-    selective_metadata = quantize_activation_selected(
-        selective, calibration_loader, device,
+    activity_data = compute_channel_activity(
+        model, calibration_loader, device,
         max_images=config.get("calibration_images", 512),
     )
-    selective_metrics = evaluate(selective, test_loader, device, class_indices)
-    quantized_count = selective_metadata["quantized_weight_count"]
-    selective_metadata["estimated_storage_bytes"] = (
-        quantized_count * selective_metadata["effective_weight_bits"] / 8
-        + (sum(parameter.numel() for parameter in selective.parameters()) - quantized_count) * 4
-        + selective_metadata["weight_group_count"] * 4
+
+    mixed_pairs = [
+        (1, 2),
+        (2, 4),
+        (4, 6),
+        (4, 8),
+        (8, 16),
+        (16, 32),
+    ]
+
+    for low_bits, high_bits in mixed_pairs:
+        selective = copy.deepcopy(model)
+        selective_metadata = quantize_activation_selected(
+            selective,
+            activity_data=activity_data,
+            low_bits=low_bits,
+            high_bits=high_bits,
+        )
+        selective_metrics = evaluate(selective, test_loader, device, class_indices)
+        quantized_count = selective_metadata["quantized_weight_count"]
+        storage_bytes = (
+            quantized_count * selective_metadata["effective_weight_bits"] / 8
+            + (sum(parameter.numel() for parameter in selective.parameters()) - quantized_count) * 4
+            + selective_metadata["weight_group_count"] * 4
+        )
+        selective_metadata["estimated_storage_bytes"] = storage_bytes
+        method_name = f"activation_selected_q{low_bits}_q{high_bits}"
+        results["methods"][method_name] = {
+            "metrics": selective_metrics,
+            "accuracy_drop": (results["fp32"]["accuracy"] - selective_metrics["accuracy"]
+                              if selective_metrics["accuracy"] is not None else None),
+            "nominal_weight_bits": selective_metadata["effective_weight_bits"],
+            "estimated_storage_bytes": storage_bytes,
+            "quantization": selective_metadata,
+        }
+        if (low_bits, high_bits) == (4, 6):
+            results["methods"]["activation_selected_q4_mixed"] = results["methods"][method_name]
+
+    # Modern Literature Methods:
+    # 1. Per-Channel Quantization & MSE Optimal Clipping (Banner et al., NeurIPS 2019)
+    per_channel_configs = [
+        ("per_channel_int8", 8, False, None),
+        ("per_channel_int4", 4, False, None),
+        ("per_channel_int4_omse", 4, True, None),
+        ("per_channel_int4_omse_preserve_int8", 4, True, "int8"),
+    ]
+    for name, bits, mse, preserve in per_channel_configs:
+        pc_model = copy.deepcopy(model)
+        pc_meta = quantize_per_channel(pc_model, bits=bits, mse_clipping=mse, preserve_edges=preserve)
+        pc_metrics = evaluate(pc_model, test_loader, device, class_indices)
+        quantized_count = pc_meta["quantized_weight_count"]
+        storage_bytes = (
+            quantized_count * pc_meta["effective_weight_bits"] / 8
+            + (sum(p.numel() for p in pc_model.parameters()) - quantized_count) * 4
+            + pc_meta["scale_count"] * 4
+        )
+        pc_meta["estimated_storage_bytes"] = storage_bytes
+        results["methods"][name] = {
+            "metrics": pc_metrics,
+            "accuracy_drop": (results["fp32"]["accuracy"] - pc_metrics["accuracy"]
+                              if pc_metrics["accuracy"] is not None else None),
+            "nominal_weight_bits": pc_meta["effective_weight_bits"],
+            "estimated_storage_bytes": storage_bytes,
+            "quantization": pc_meta,
+        }
+
+    # 2. Group-wise / Block-wise Quantization (AWQ, GPTQ, GGUF style)
+    groupwise_configs = [
+        ("groupwise_int4_g64", 4, 64, False),
+        ("groupwise_int4_g32", 4, 32, False),
+        ("groupwise_int4_g32_asym", 4, 32, True),
+        ("groupwise_int3_g32", 3, 32, False),
+        ("groupwise_int3_g32_asym", 3, 32, True),
+    ]
+    for name, gbits, gsize, gasym in groupwise_configs:
+        gw_model = copy.deepcopy(model)
+        gw_meta = quantize_groupwise(gw_model, bits=gbits, group_size=gsize, asymmetric=gasym)
+        gw_metrics = evaluate(gw_model, test_loader, device, class_indices)
+        quantized_count = gw_meta["quantized_weight_count"]
+        scale_bytes = gw_meta["scale_count"] * (5 if gasym else 4)  # 4B scale + 1B zero-point if asym
+        storage_bytes = (
+            quantized_count * gw_meta["effective_weight_bits"] / 8
+            + (sum(p.numel() for p in gw_model.parameters()) - quantized_count) * 4
+            + scale_bytes
+        )
+        gw_meta["estimated_storage_bytes"] = storage_bytes
+        results["methods"][name] = {
+            "metrics": gw_metrics,
+            "accuracy_drop": (results["fp32"]["accuracy"] - gw_metrics["accuracy"]
+                              if gw_metrics["accuracy"] is not None else None),
+            "nominal_weight_bits": gw_meta["effective_weight_bits"],
+            "estimated_storage_bytes": storage_bytes,
+            "quantization": gw_meta,
+        }
+
+    # 3. Sensitivity-Guided Mixed-Precision Allocation (HAWQ / Fisher Pareto Optimization)
+    print("Computing calibration layer perturbation sensitivities for Pareto optimization...")
+    sensitivities = compute_layer_sensitivities(
+        model,
+        calibration_loader,
+        device,
+        candidate_bits=(1, 2, 3, 4, 8),
+        group_size=32,
+        asymmetric=True,
+        max_images=128,
     )
-    results["methods"]["activation_selected_q4_mixed"] = {
-        "metrics": selective_metrics,
-        "accuracy_drop": (results["fp32"]["accuracy"] - selective_metrics["accuracy"]
-                          if selective_metrics["accuracy"] is not None else None),
-        "nominal_weight_bits": selective_metadata["effective_weight_bits"],
-        "estimated_storage_bytes": selective_metadata["estimated_storage_bytes"],
-        "quantization": selective_metadata,
-    }
+
+    pareto_targets = [2.0, 2.2, 2.5, 3.0, 3.5, 4.0]
+    for target_bits in pareto_targets:
+        sg_model = copy.deepcopy(model)
+        sg_meta = quantize_sensitivity_guided(
+            sg_model,
+            target_effective_bits=target_bits,
+            sensitivities=sensitivities,
+            group_size=32,
+            asymmetric=True,
+            candidate_bits=(1, 2, 3, 4, 8),
+        )
+        sg_metrics = evaluate(sg_model, test_loader, device, class_indices)
+        quantized_count = sg_meta["quantized_weight_count"]
+        scale_bytes = sg_meta["scale_count"] * 5  # 4B scale + 1B zero-point
+        storage_bytes = (
+            quantized_count * sg_meta["effective_weight_bits"] / 8
+            + (sum(p.numel() for p in sg_model.parameters()) - quantized_count) * 4
+            + scale_bytes
+        )
+        sg_meta["estimated_storage_bytes"] = storage_bytes
+        method_name = f"pareto_sensitivity_guided_{target_bits}b"
+        results["methods"][method_name] = {
+            "metrics": sg_metrics,
+            "accuracy_drop": (results["fp32"]["accuracy"] - sg_metrics["accuracy"]
+                              if sg_metrics["accuracy"] is not None else None),
+            "nominal_weight_bits": round(sg_meta["effective_weight_bits"], 2),
+            "estimated_storage_bytes": storage_bytes,
+            "quantization": sg_meta,
+        }
 
     path = output / "metrics/pretrained_resnet18_quantization.json"
     path.write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")

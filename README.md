@@ -9,8 +9,9 @@ post-training weight quantization. It does not train or fine-tune the model.
   weights (`ResNet18_Weights.DEFAULT`). The weights are downloaded from the
   official torchvision checkpoint host on first run and cached by torchvision.
 - **Quantization:** blind symmetric global-scale weight quantization at INT16,
-  INT8, INT4, INT2, and 1-bit. Biases and activations stay FP32. Quantized
-  weights are dequantized to FP32 for inference, so this measures the effect of
+  INT8, INT4, INT2, and 1-bit. Biases, batch normalization, and activations stay FP32.
+  One-bit uses mean-absolute scaling (XNOR-Net style) to prevent activation overflow.
+  Quantized weights are dequantized to FP32 for inference, so this measures the effect of
   quantization; it does not run packed integer kernels or measure latency.
 - **Selective format:** an activation-informed mixed precision format. It
   forwards separate Imagenette training images through the network, measures
@@ -59,29 +60,41 @@ Results are written to
 the original model and every quantized copy on the same 500 Imagenette images,
 and includes 10-class test accuracy, accuracy drop, quantization settings,
 parameter count, calibration/test sample counts, and estimated storage.
-Storage is an estimate and excludes container/alignment overhead. The blind
-baseline uses one global scale; the selective method uses one scale per
-input-channel group and leaves batch-normalization weights in FP32.
+Storage is an estimate and excludes container/alignment overhead. In addition to blind
+global scaling, the repository implements activation-selected mixed precision across
+multiple bit pairs, per-channel symmetric quantization with OMSE clipping, block-level
+group-wise quantization (symmetric and asymmetric), and HAWQ/Fisher-style sensitivity-guided
+mixed-precision budget allocation that pushes sub-3-bit and 2-bit frontiers. All methods keep
+batch-normalization parameters and biases in FP32.
 
 ### Latest quick comparison
 
 Measured on 500 images (50 per class), with predictions restricted to the 10
 Imagenette classes:
 
-| Method | Effective weight bits | Top-1 accuracy | Accuracy drop |
-| --- | ---: | ---: | ---: |
-| Original FP32 | 32 | 97.4% | — |
-| Blind global INT8 | 8 | 97.0% | 0.4 points |
-| Blind global INT4 | 4 | 10.4% | 87.0 points |
-| Activation-selected 4/6-bit groups | 4.50 | 96.4% | 1.0 point |
-| Blind global INT2 | 2 | 10.0% | 87.4 points |
-| Blind global INT1 | 1 | Non-finite outputs | — |
-
-The mixed method keeps more-active input-channel groups at 6 bits and uses 4
-bits for the rest. In this quick run it retained 96.4% accuracy with an
-estimated 6.63 MB parameter storage, compared with 46.76 MB for FP32. These
-numbers are an initial 500-image measurement, not a claim about full ImageNet
-validation accuracy.
+| Family | Method | Effective Bits | Top-1 Accuracy | Accuracy Drop | Loss | Storage |
+|---|---|---:|---:|---:|---:|---:|
+| **Baseline** | Original FP32 | 32.00 | 97.4% | — | 0.0726 | 46.76 MB |
+| **Sensitivity-Guided Pareto** | Pareto Budget 3.5b | 3.53 | **98.2%** | -0.8 points | 0.0679 | 7.02 MB |
+| **Sensitivity-Guided Pareto** | Pareto Budget 3.0b | 3.03 | **98.0%** | -0.6 points | 0.0622 | 6.29 MB |
+| **Sensitivity-Guided Pareto** | Pareto Budget 2.5b | 2.53 | **97.8%** | -0.4 points | 0.0711 | 5.56 MB |
+| **Sensitivity-Guided Pareto** | Pareto Budget 2.2b | 2.25 | **95.6%** | 1.8 points | 0.1181 | 5.14 MB |
+| **Sensitivity-Guided Pareto** | Pareto Budget 2.0b | 2.04 | **92.8%** | 4.6 points | 0.2137 | 4.85 MB |
+| **Group-wise (AWQ / GPTQ / GGUF)** | Group-wise INT4 ($G=32$, Asym) | 4.00 | 96.6% | 0.8 points | 0.1125 | 7.71 MB |
+| **Group-wise (AWQ / GPTQ / GGUF)** | Group-wise INT4 ($G=32$, Sym) | 4.00 | 95.4% | 2.0 points | 0.1370 | 7.34 MB |
+| **Group-wise (AWQ / GPTQ / GGUF)** | Group-wise INT4 ($G=64$, Sym) | 4.00 | 95.2% | 2.2 points | 0.1299 | 6.61 MB |
+| **Group-wise (AWQ / GPTQ / GGUF)** | Group-wise INT3 ($G=32$, Asym) | 3.00 | 91.8% | 5.6 points | 0.2316 | 6.25 MB |
+| **Group-wise (AWQ / GPTQ / GGUF)** | Group-wise INT3 ($G=32$, Sym) | 3.00 | 82.6% | 14.8 points | 0.5472 | 5.88 MB |
+| **Per-Channel + OMSE** | Per-Channel INT4 (MSE Clipped) | 4.00 | 93.0% | 4.4 points | 0.2477 | 5.91 MB |
+| **Per-Channel (PyTorch / TensorRT)** | Per-Channel INT4 | 4.00 | 89.6% | 7.8 points | 0.3257 | 5.91 MB |
+| **Per-Channel (PyTorch / TensorRT)** | Per-Channel INT8 | 8.00 | 97.6% | -0.2 points | 0.0738 | 11.74 MB |
+| **Activation-Selected Mixed** | Mixed 4/8-bit | 5.00 | 97.6% | -0.2 points | 0.0743 | 7.36 MB |
+| **Activation-Selected Mixed** | Mixed 4/6-bit (GGUF Q4_K_M) | 4.50 | 96.4% | 1.0 point | 0.0951 | 6.63 MB |
+| **Activation-Selected Mixed** | Mixed 2/4-bit | 2.50 | 13.6% | 83.8 points | 6.8182 | 3.71 MB |
+| **Blind Global** | Global INT8 | 8.00 | 97.8% | -0.4 points | 0.0778 | 11.72 MB |
+| **Blind Global** | Global INT4 | 4.00 | 10.0% | 87.4 points | 69.05 | 5.88 MB |
+| **Blind Global** | Global INT2 | 2.00 | 10.0% | 87.4 points | 2.3027 | 2.96 MB |
+| **Blind Global** | Global INT1 (XNOR-Net scale) | 1.00 | 10.0% | 87.4 points | 2.3131 | 1.50 MB |
 
 ## Future scope
 
